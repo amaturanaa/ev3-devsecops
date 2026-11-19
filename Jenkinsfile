@@ -61,6 +61,70 @@ pipeline {
                 '''
             }
         }
+        
+        stage('5. ZAP') {
+            environment {
+                ZAP_API_KEY = credentials('zap-api-key')
+                ZAP_URL     = 'http://zap:8090'
+                TARGET_URL  = 'http://host.docker.internal:5000'
+                EXTRA_PATHS = '/ /login /tasks'     
+            }
+            options { timeout(time: 25, unit: 'MINUTES') }
+            steps {
+                script {
+                    def rc = sh(returnStatus: true, script: '''#!/bin/bash
+set -euo pipefail
+Z() { code=$(curl -s -G -o /tmp/zap.out -w '%{http_code}' "$ZAP_URL$1" "${@:2}" --data-urlencode "apikey=$ZAP_API_KEY") || return 1
+  if [ "$code" -ge 400 ]; then echo "ERROR ZAP $1 -> HTTP $code: $(cat /tmp/zap.out)" >&2; return 1; fi
+  cat /tmp/zap.out; }
+jget() { python3 -c "import sys,json;d=json.load(sys.stdin);print(d$1)"; }
+
+# 1) Esperar a ZAP
+for i in $(seq 1 30); do Z /JSON/core/view/version/ >/dev/null 2>&1 && break || sleep 2; done
+Z /JSON/core/view/version/ >/dev/null
+
+# 2) Sesión limpia + sembrar rutas
+Z /JSON/core/action/newSession/ --data-urlencode "name=build${BUILD_NUMBER}" --data-urlencode "overwrite=true" >/dev/null
+for p in $EXTRA_PATHS; do
+  Z /JSON/core/action/accessUrl/ --data-urlencode "url=${TARGET_URL}${p}" --data-urlencode "followRedirects=true" >/dev/null
+done
+
+# 3) Spider
+sid=$(Z /JSON/spider/action/scan/ --data-urlencode "url=$TARGET_URL" --data-urlencode "recurse=true" | jget "['scan']")
+while :; do st=$(Z /JSON/spider/view/status/ --data-urlencode "scanId=$sid" | jget "['status']"); echo "Spider: $st%"; [ "$st" -ge 100 ] && break; sleep 3; done
+
+# 4) Active scan
+aid=$(Z /JSON/ascan/action/scan/ --data-urlencode "url=$TARGET_URL" --data-urlencode "recurse=true" | jget "['scan']")
+while :; do st=$(Z /JSON/ascan/view/status/ --data-urlencode "scanId=$aid" | jget "['status']"); echo "Active scan: $st%"; [ "$st" -ge 100 ] && break; sleep 10; done
+
+# 5) Reportes
+mkdir -p zap-reports
+Z /OTHER/core/other/htmlreport/ > zap-reports/zap-report.html
+Z /OTHER/core/other/jsonreport/ > zap-reports/zap-report.json
+
+# 6) Resumen por riesgo
+Z /JSON/alert/view/alerts/ --data-urlencode "baseurl=$TARGET_URL" --data-urlencode "start=0" --data-urlencode "count=5000" > zap-reports/alerts.json
+python3 - <<'PY'
+import json, collections
+a = json.load(open("zap-reports/alerts.json")).get("alerts", [])
+c = collections.Counter(x["risk"] for x in a)
+for k in ("High","Medium","Low","Informational"): print(f"{k}: {c.get(k,0)}")
+open("zap-reports/resumen.txt","w").write(f"high={c.get('High',0)}\\n")
+raise SystemExit(10 if c.get("High",0) else 0)
+PY
+''')
+                    if (rc == 10)     { unstable('ZAP encontró vulnerabilidades de riesgo High (ver ZAP Report)') }
+                    else if (rc != 0) { error("El stage ZAP falló (código ${rc})") }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'zap-reports/**', allowEmptyArchive: true
+                    publishHTML(target: [reportDir: 'zap-reports', reportFiles: 'zap-report.html',
+                                         reportName: 'ZAP Report', keepAll: true, allowMissing: true])
+                }
+            }
+        }
     }
 
     post {

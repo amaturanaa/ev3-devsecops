@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # Dependencias Python (requirements.txt)
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  # Imagen base del Dockerfile de la app (python:3.12-slim)
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Imágenes del stack de monitoreo (cAdvisor, Prometheus, Grafana)
+  - package-ecosystem: "docker"
+    directory: "/monitoring"
+    schedule:
+      interval: "weekly"

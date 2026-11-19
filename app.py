@@ -1,92 +1,145 @@
-from flask import Flask, request, render_template_string, redirect, make_response
+from flask import (Flask, request, render_template_string, redirect,
+                   url_for, session, flash)
 import sqlite3
+import os
+import re
+from functools import wraps
+from werkzeug.security import check_password_hash
+from flask_wtf import CSRFProtect
 
 app = Flask(__name__)
+# CORRECCION: clave secreta desde variable de entorno (no hardcodeada).
+app.secret_key = os.environ.get('SECRET_KEY') or os.urandom(24)
 
-def db_query(query):
-    """Función auxiliar para ejecutar queries (Vulnerable por diseño)"""
+# CORRECCION (CSRF): protege automaticamente todos los formularios POST.
+csrf = CSRFProtect(app)
+
+# CORRECCION (cookie insegura): la sesion de Flask va firmada y con flags seguras.
+app.config['SESSION_COOKIE_HTTPONLY'] = True   # el JS no puede leer la cookie
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # defensa extra contra CSRF
+# En produccion con HTTPS: app.config['SESSION_COOKIE_SECURE'] = True
+
+
+def get_db():
     conn = sqlite3.connect('vulnerable.db')
     conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    # Aquí ocurre el SQLi: ejecutamos la string tal cual viene
-    cursor.execute(query)
-    result = cursor.fetchall()
-    conn.commit()
-    conn.close()
-    return result
+    return conn
 
-# --- LOGIN (Vulnerable a SQL Injection) ---
+
+# Validacion de entrada (lista blanca)
+USERNAME_RE = re.compile(r'^[A-Za-z0-9_]{3,20}$')
+
+
+def login_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if 'username' not in session:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return wrapper
+
+
+# --- LOGIN (SQLi y contrasenas corregidos) ---
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        user = request.form.get('username')
-        pw = request.form.get('password')
-        
-        # El SQLi clásico: saltarse el password con ' OR '1'='1
-        query = f"SELECT * FROM usuarios WHERE username = '{user}' AND password = '{pw}'"
-        usuarios = db_query(query)
-        
-        if usuarios:
-            usuario = usuarios[0]
-            resp = make_response(redirect('/dashboard'))
-            # Vulnerable: Cookie de sesión en texto plano y sin flags de seguridad
-            resp.set_cookie('user_session', usuario['username'])
-            return resp
-        return "<h3>Acceso denegado</h3><a href='/login'>Volver</a>", 401
+        user = request.form.get('username', '')
+        pw = request.form.get('password', '')
 
-    return '''
-        <h2>Login del Sistema Académico</h2>
+        # Validacion de formato antes de consultar la BD
+        if not USERNAME_RE.fullmatch(user) or not pw:
+            flash('Credenciales con formato invalido.')
+            return redirect(url_for('login'))
+
+        conn = get_db()
+        # CORRECCION (SQLi): consulta parametrizada, el dato va aparte con ?
+        fila = conn.execute(
+            'SELECT * FROM usuarios WHERE username = ?', (user,)).fetchone()
+        conn.close()
+
+        # CORRECCION (contrasenas): se verifica el hash seguro, no texto plano
+        if fila and check_password_hash(fila['password'], pw):
+            session.clear()                 # evita fijacion de sesion
+            session['username'] = fila['username']
+            session['rol'] = fila['rol']
+            return redirect(url_for('dashboard'))
+
+        flash('Acceso denegado')
+        return redirect(url_for('login'))
+
+    return render_template_string('''
+        {% with messages = get_flashed_messages() %}
+          {% for m in messages %}<p style="color:red">{{ m }}</p>{% endfor %}
+        {% endwith %}
+        <h2>Login del Sistema Academico</h2>
         <form method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             Usuario: <input type="text" name="username"><br>
             Password: <input type="password" name="password"><br>
             <input type="submit" value="Ingresar">
         </form>
-    '''
+    ''')
 
-# --- DASHBOARD (Vulnerable a XSS y CSRF) ---
+
+# --- DASHBOARD (XSS corregido) ---
 @app.route('/dashboard')
+@login_required
 def dashboard():
-    username = request.cookies.get('user_session')
-    if not username:
-        return redirect('/login')
+    conn = get_db()
+    datos = conn.execute(
+        'SELECT * FROM usuarios WHERE username = ?',
+        (session['username'],)).fetchone()
+    conn.close()
 
-    # Buscamos los datos del usuario logueado
-    datos = db_query(f"SELECT * FROM usuarios WHERE username = '{username}'")[0]
+    # CORRECCION (XSS): las variables se pasan por contexto y Jinja2 las
+    # escapa automaticamente con {{ }}. Un <script> se muestra como texto.
+    return render_template_string('''
+        <h1>Panel de {{ usuario }}</h1>
+        <p><b>Rol:</b> {{ rol }}</p>
+        <p><b>Biografia:</b> {{ bio }}</p>
+        <hr>
+        <h3>Actualizar Biografia</h3>
+        <form action="{{ url_for('update_bio') }}" method="POST">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="text" name="nueva_bio" placeholder="Escribe algo...">
+            <input type="submit" value="Guardar Cambios">
+        </form>
+        <br><a href="{{ url_for('logout') }}">Cerrar Sesion</a>
+    ''', usuario=datos['username'], rol=datos['rol'], bio=datos['bio'])
 
-    # Vulnerabilidad XSS: render_template_string no escapa variables puestas con f-strings
-    html = f"""
-    <h1>Panel de {datos['username']}</h1>
-    <p><b>Rol:</b> {datos['rol']}</p>
-    <p><b>Biografía:</b> {datos['bio']}</p>
-    <hr>
-    <h3>Actualizar Biografía (Objetivo CSRF)</h3>
-    <form action="/update_bio" method="POST">
-        <input type="text" name="nueva_bio" placeholder="Escribe algo...">
-        <input type="submit" value="Guardar Cambios">
-    </form>
-    <br><a href="/logout">Cerrar Sesión</a>
-    """
-    return render_template_string(html)
 
 @app.route('/update_bio', methods=['POST'])
+@login_required
 def update_bio():
-    username = request.cookies.get('user_session')
-    if username:
-        nueva_bio = request.form.get('nueva_bio')
-        # Vulnerable a CSRF: No hay token de validación
-        db_query(f"UPDATE usuarios SET bio = '{nueva_bio}' WHERE username = '{username}'")
-    return redirect('/dashboard')
+    nueva_bio = request.form.get('nueva_bio', '')
+
+    # Validacion simple de largo
+    if len(nueva_bio) > 500:
+        flash('La biografia es demasiado larga.')
+        return redirect(url_for('dashboard'))
+
+    conn = get_db()
+    # CORRECCION (SQLi): parametrizada. El CSRF ya lo cubre CSRFProtect.
+    conn.execute(
+        'UPDATE usuarios SET bio = ? WHERE username = ?',
+        (nueva_bio, session['username']))
+    conn.commit()
+    conn.close()
+    return redirect(url_for('dashboard'))
+
 
 @app.route('/logout')
 def logout():
-    resp = make_response(redirect('/login'))
-    resp.set_cookie('user_session', '', expires=0)
-    return resp
+    session.clear()
+    return redirect(url_for('login'))
+
 
 @app.route('/')
 def home():
-    return redirect('/login')
+    return redirect(url_for('login'))
+
 
 if __name__ == '__main__':
-    # Ejecución en modo debug para fines académicos
-    app.run(debug=True, port=5000)
+    # CORRECCION (debug): debug=False para no exponer el depurador de Werkzeug.
+    # host 0.0.0.0 para que sea accesible desde el contenedor de ZAP.
+    app.run(debug=False, host='0.0.0.0', port=5000)

@@ -6,6 +6,7 @@ import re
 from functools import wraps
 from werkzeug.security import check_password_hash
 from flask_wtf import CSRFProtect
+from werkzeug.serving import WSGIRequestHandler
 
 app = Flask(__name__)
 # CORRECCION: clave secreta desde variable de entorno (no hardcodeada).
@@ -13,6 +14,16 @@ app.secret_key = os.environ.get('SECRET_KEY') or os.urandom(24)
 
 # CORRECCION (CSRF): protege automaticamente todos los formularios POST.
 csrf = CSRFProtect(app)
+
+@app.after_request
+def cabeceras_seguridad(resp):
+    resp.headers['Content-Security-Policy'] = (
+        "default-src 'self'; frame-ancestors 'none'; "
+        "form-action 'self'; base-uri 'self'")
+    resp.headers['X-Frame-Options'] = 'DENY'
+    resp.headers['X-Content-Type-Options'] = 'nosniff'
+    resp.headers['Server'] = 'webserver'   # oculta Werkzeug/Python y sus versiones
+    return resp
 
 # CORRECCION (cookie insegura): la sesion de Flask va firmada y con flags seguras.
 app.config['SESSION_COOKIE_HTTPONLY'] = True   # el JS no puede leer la cookie
@@ -69,7 +80,7 @@ def login():
 
     return render_template_string('''
         {% with messages = get_flashed_messages() %}
-          {% for m in messages %}<p style="color:red">{{ m }}</p>{% endfor %}
+          {% for m in messages %}<p><b>{{ m }}</b></p>{% endfor %}
         {% endwith %}
         <h2>Login del Sistema Academico</h2>
         <form method="post">
@@ -138,8 +149,11 @@ def logout():
 def home():
     return redirect(url_for('login'))
 
+class HandlerSeguro(WSGIRequestHandler):
+    server_version = 'webserver'
+    sys_version = ''
 
 if __name__ == '__main__':
     # CORRECCION (debug): debug=False para no exponer el depurador de Werkzeug.
     # host 0.0.0.0 para que sea accesible desde el contenedor de ZAP.
-    app.run(debug=False, host='0.0.0.0', port=5000)
+    app.run(debug=False, host='0.0.0.0', port=5000, request_handler=HandlerSeguro)

@@ -6,7 +6,7 @@ pipeline {
                 ZAP_API_KEY = credentials('zap-api-key')
                 ZAP_URL     = 'http://zap:8090'
                 TARGET_URL  = 'http://host.docker.internal:5000'
-                EXTRA_PATHS = '/ /login /tasks'     
+                EXTRA_PATHS = '/ /login /dashboard'     
             }
             options { timeout(time: 25, unit: 'MINUTES') }
             steps {
